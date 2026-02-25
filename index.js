@@ -18,6 +18,11 @@ function extractSlugFromUrl(input) {
     if (eventIndex !== -1 && parts[eventIndex + 1]) {
       return parts[eventIndex + 1];
     }
+    // For sports and other sections, fall back to the last path segment,
+    // e.g. /sports/dota-2/dota2-lix0es-lynx-2026-02-25
+    if (parts.length > 0) {
+      return parts[parts.length - 1];
+    }
     return null;
   } catch {
     return null;
@@ -38,6 +43,62 @@ function buildEventsUrlFromInput(rawInput) {
   });
 
   return `${GAMMA_BASE_URL}/events?${params.toString()}`;
+}
+
+async function resolveEventFromInput(rawInput) {
+  const input = rawInput.trim();
+  const slugFromUrl = extractSlugFromUrl(input);
+
+  // 1) Try direct events lookup by slug (works for most non-sports markets).
+  if (slugFromUrl) {
+    const params = new URLSearchParams({
+      slug: slugFromUrl,
+      active: 'true',
+      closed: 'false',
+      limit: '1',
+    });
+    const directUrl = `${GAMMA_BASE_URL}/events?${params.toString()}`;
+    const directResp = await axios.get(directUrl);
+    if (Array.isArray(directResp.data) && directResp.data.length > 0) {
+      return directResp.data[0];
+    }
+  }
+
+  // 2) Fallback: use public-search so we can handle sports URLs, series pages,
+  // and other slugs that don't map 1:1 to /events.
+  const searchQuery = slugFromUrl || input;
+  const searchResp = await axios.get(`${GAMMA_BASE_URL}/public-search`, {
+    params: {
+      q: searchQuery,
+      limit_per_type: 5,
+      cache: true,
+    },
+  });
+
+  const events = searchResp.data && Array.isArray(searchResp.data.events)
+    ? searchResp.data.events
+    : [];
+
+  if (!events.length) {
+    return null;
+  }
+
+  // Prefer events that are active and whose slug includes the slugFromUrl hint, if present.
+  if (slugFromUrl) {
+    const normalized = slugFromUrl.toLowerCase();
+    const filtered = events.filter(
+      (e) =>
+        e &&
+        typeof e.slug === 'string' &&
+        e.slug.toLowerCase().includes(normalized),
+    );
+    if (filtered.length) {
+      return filtered[0];
+    }
+  }
+
+  // Otherwise just take the first event result.
+  return events[0];
 }
 
 function buildMarketsUrlFromInput(rawInput) {
@@ -108,14 +169,24 @@ function parseMarketSnapshot(market) {
     clobTokenIds = [];
   }
 
-  const yesIndex =
+  // Determine primary and secondary outcome indices.
+  // Prefer explicit "Yes"/"No" labels, but fall back to the first two outcomes
+  // so this also works for "Up/Down" markets and team vs team markets.
+  let yesIndex =
     outcomes.findIndex(
       (o) => typeof o === 'string' && o.toLowerCase() === 'yes',
     ) ?? -1;
-  const noIndex =
+  let noIndex =
     outcomes.findIndex(
       (o) => typeof o === 'string' && o.toLowerCase() === 'no',
     ) ?? -1;
+
+  if (yesIndex === -1 || noIndex === -1) {
+    if (Array.isArray(outcomes) && outcomes.length >= 2) {
+      yesIndex = 0;
+      noIndex = 1;
+    }
+  }
 
   const yesPrice =
     yesIndex >= 0 && outcomePrices[yesIndex] != null
@@ -141,6 +212,8 @@ function parseMarketSnapshot(market) {
     outcomes,
     yesPrice,
     noPrice,
+    yesLabel: yesIndex >= 0 ? outcomes[yesIndex] : 'Yes',
+    noLabel: noIndex >= 0 ? outcomes[noIndex] : 'No',
     yesAssetId,
     noAssetId,
   };
@@ -168,14 +241,10 @@ app.get('/api/event', async (req, res) => {
   }
 
   try {
-    const url = buildEventsUrlFromInput(input);
-    const response = await axios.get(url);
-
-    if (!Array.isArray(response.data) || response.data.length === 0) {
+    const event = await resolveEventFromInput(input);
+    if (!event) {
       return res.status(404).json({ error: 'No event found for input' });
     }
-
-    const event = response.data[0];
     const markets = parseEventMarkets(event).filter(
       (m) =>
         m.yesAssetId &&
