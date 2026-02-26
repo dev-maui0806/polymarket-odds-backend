@@ -192,11 +192,10 @@ function parseMarketSnapshot(market) {
     yesIndex >= 0 && outcomePrices[yesIndex] != null
       ? outcomePrices[yesIndex]
       : null;
+  // Use Gamma's noPrice only; never derive from 1 - yesPrice (causes 99-99 / 50-50 noise).
   const noPrice =
     noIndex >= 0 && outcomePrices[noIndex] != null
       ? outcomePrices[noIndex]
-      : yesPrice != null
-      ? 1 - yesPrice
       : null;
 
   const yesAssetId =
@@ -245,12 +244,33 @@ app.get('/api/event', async (req, res) => {
     if (!event) {
       return res.status(404).json({ error: 'No event found for input' });
     }
-    const markets = parseEventMarkets(event).filter(
-      (m) =>
-        m.yesAssetId &&
-        m.noAssetId &&
-        (m.yesPrice != null || m.noPrice != null),
+    // Include ALL markets with tradable assets; prices may come from WebSocket.
+    let markets = parseEventMarkets(event).filter(
+      (m) => m.yesAssetId && m.noAssetId,
     );
+
+    // For sports events with gameId, fetch additional markets (Spreads, Totals, Both Teams, etc.).
+    const gameId = event.gameId || event.game_id;
+    if (gameId != null) {
+      try {
+        const marketsUrl = `${GAMMA_BASE_URL}/markets?game_id=${gameId}&active=true&closed=false&limit=100`;
+        const marketsResp = await axios.get(marketsUrl);
+        const extraMarkets = Array.isArray(marketsResp.data) ? marketsResp.data : [];
+        const seen = new Set(markets.map((m) => m.marketId));
+        for (const m of extraMarkets) {
+          const snapshot = parseMarketSnapshot(m);
+          if (snapshot.yesAssetId && snapshot.noAssetId && !seen.has(snapshot.marketId)) {
+            seen.add(snapshot.marketId);
+            markets.push({
+              label: m.groupItemTitle || m.question || m.slug,
+              ...snapshot,
+            });
+          }
+        }
+      } catch {
+        // Ignore; use event.markets only
+      }
+    }
 
     if (!markets.length) {
       return res
