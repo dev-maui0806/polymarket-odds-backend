@@ -10,6 +10,25 @@ app.use(express.json());
 
 const GAMMA_BASE_URL = process.env.GAMMA_BASE_URL || 'https://gamma-api.polymarket.com';
 
+// Sports market types we request in addition to event.markets (moneyline).
+// Gamma /markets?game_id=&sports_market_types= accepts these; when data exists we merge.
+const SPORTS_MARKET_TYPES_EXTRA = [
+  'spreads',
+  'totals',
+  'both_teams_to_score',
+  'total_goals',
+  'nrfi',
+  'team_totals',
+  'team_totals_home',
+  'team_totals_away',
+  'first_half_moneyline',
+  'first_half_spreads',
+  'first_half_totals',
+  'correct_score',
+  'double_chance',
+  'total_corners',
+];
+
 function extractSlugFromUrl(input) {
   try {
     const url = new URL(input);
@@ -249,15 +268,24 @@ app.get('/api/event', async (req, res) => {
       (m) => m.yesAssetId && m.noAssetId,
     );
 
-    // For sports events with gameId, fetch additional markets (Spreads, Totals, Both Teams, etc.).
+    // For sports events with gameId, request ALL market types from Gamma (spreads, totals, both_teams_to_score, etc.).
     const gameId = event.gameId || event.game_id;
     if (gameId != null) {
+      const seen = new Set(markets.map((m) => m.marketId));
+
+      // 1) Request with all extra sports_market_types in one call (Gamma accepts array as repeated params).
       try {
-        const marketsUrl = `${GAMMA_BASE_URL}/markets?game_id=${gameId}&active=true&closed=false&limit=100`;
-        const marketsResp = await axios.get(marketsUrl);
-        const extraMarkets = Array.isArray(marketsResp.data) ? marketsResp.data : [];
-        const seen = new Set(markets.map((m) => m.marketId));
-        for (const m of extraMarkets) {
+        const allExtra = await axios.get(`${GAMMA_BASE_URL}/markets`, {
+          params: {
+            game_id: String(gameId),
+            sports_market_types: SPORTS_MARKET_TYPES_EXTRA,
+            active: true,
+            closed: false,
+            limit: 100,
+          },
+        });
+        const list = Array.isArray(allExtra.data) ? allExtra.data : [];
+        for (const m of list) {
           const snapshot = parseMarketSnapshot(m);
           if (snapshot.yesAssetId && snapshot.noAssetId && !seen.has(snapshot.marketId)) {
             seen.add(snapshot.marketId);
@@ -267,8 +295,61 @@ app.get('/api/event', async (req, res) => {
             });
           }
         }
-      } catch {
-        // Ignore; use event.markets only
+      } catch (e) {
+        // 2) If single request fails (e.g. 422), try per-type requests.
+        if (e.response && e.response.status === 422) {
+          for (const marketType of SPORTS_MARKET_TYPES_EXTRA) {
+            try {
+              const resp = await axios.get(`${GAMMA_BASE_URL}/markets`, {
+                params: {
+                  game_id: String(gameId),
+                  sports_market_types: [marketType],
+                  active: true,
+                  closed: false,
+                  limit: 100,
+                },
+              });
+              const list = Array.isArray(resp.data) ? resp.data : [];
+              for (const m of list) {
+                const snapshot = parseMarketSnapshot(m);
+                if (snapshot.yesAssetId && snapshot.noAssetId && !seen.has(snapshot.marketId)) {
+                  seen.add(snapshot.marketId);
+                  markets.push({
+                    label: m.groupItemTitle || m.question || m.slug,
+                    ...snapshot,
+                  });
+                }
+              }
+            } catch {
+              // Skip this type
+            }
+          }
+        } else {
+          // 3) Fallback: single request without sports_market_types (any type).
+          try {
+            const resp = await axios.get(`${GAMMA_BASE_URL}/markets`, {
+              params: {
+                game_id: String(gameId),
+                active: true,
+                closed: false,
+                limit: 100,
+              },
+            });
+            const list = Array.isArray(resp.data) ? resp.data : [];
+            for (const m of list) {
+              const snapshot = parseMarketSnapshot(m);
+              if (snapshot.yesAssetId && snapshot.noAssetId && !seen.has(snapshot.marketId)) {
+                seen.add(snapshot.marketId);
+                markets.push({
+                  label: m.groupItemTitle || m.question || m.slug,
+                  ...snapshot,
+                });
+              }
+            }
+          } catch {
+            // Ignore
+          }
+        }
       }
     }
 
@@ -318,6 +399,23 @@ app.get('/api/market', async (req, res) => {
   } catch (err) {
     console.error('Error fetching market', err.message || err);
     return res.status(500).json({ error: 'Failed to fetch market data' });
+  }
+});
+
+app.get('/api/sports-market-types', async (_req, res) => {
+  try {
+    const resp = await axios.get(`${GAMMA_BASE_URL}/sports/market-types`);
+    const fromGamma = (resp.data && resp.data.marketTypes) || [];
+    res.json({
+      requested_for_sports_events: SPORTS_MARKET_TYPES_EXTRA,
+      all_valid_types: fromGamma,
+    });
+  } catch (err) {
+    console.error('Error fetching sports market types', err.message || err);
+    res.status(500).json({
+      error: 'Failed to fetch sports market types',
+      requested_for_sports_events: SPORTS_MARKET_TYPES_EXTRA,
+    });
   }
 });
 
